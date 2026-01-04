@@ -275,6 +275,96 @@ drift prune --yes  # Skip confirmation
 | `--hourly-days` | `90` | Keep hourly stats for this many days |
 | `--yes`, `-y` | false | Skip confirmation prompt |
 
+#### `drift rollup`
+
+Aggregates raw stats into hourly buckets for efficient long-term storage.
+
+```bash
+drift rollup
+drift rollup --hours 48  # Process last 48 hours
+```
+
+Safe to run multiple times - uses upsert semantics.
+
+#### `drift new-queries`
+
+Shows queries that first appeared recently.
+
+```bash
+drift new-queries
+drift new-queries --since 7d --limit 100
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--since`, `-s` | `24h` | Time window to check |
+| `--limit`, `-n` | `50` | Maximum results |
+| `--database`, `-d` | all | Filter to specific database |
+
+### Alerting
+
+#### `drift alerts rules`
+
+Lists all configured alert rules.
+
+```bash
+drift alerts rules
+```
+
+#### `drift alerts add <name>`
+
+Creates a new alert rule.
+
+```bash
+drift alerts add "High Latency" --type latency_increase --threshold 50
+drift alerts add "Cache Problem" --type cache_drop --threshold 10 --webhook https://hooks.slack.com/...
+```
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--type`, `-t` | yes | Rule type: `latency_increase`, `cache_drop`, `temp_disk` |
+| `--threshold`, `-T` | no | Threshold value (default: 50) |
+| `--webhook`, `-w` | no | Webhook URL for notifications |
+
+#### `drift alerts remove <rule_id>`
+
+Removes an alert rule.
+
+```bash
+drift alerts remove 1
+drift alerts remove 1 --yes  # Skip confirmation
+```
+
+#### `drift alerts events`
+
+Lists triggered alert events.
+
+```bash
+drift alerts events
+drift alerts events --unack  # Only unacknowledged
+drift alerts events --limit 50
+```
+
+#### `drift alerts ack <event_id>`
+
+Acknowledges an alert event.
+
+```bash
+drift alerts ack 1
+```
+
+#### `drift alerts check`
+
+Runs anomaly detection against configured rules.
+
+```bash
+drift alerts check
+drift alerts check --database production
+drift alerts check --no-notify  # Skip webhook notifications
+```
+
+Compares recent query performance against 7-day baseline and creates alert events for any anomalies.
+
 ## Data Privacy
 
 Drift collects query performance metrics from `pg_stat_statements`. Here's what gets stored:
@@ -291,6 +381,8 @@ Drift collects query performance metrics from `pg_stat_statements`. Here's what 
 - Database credentials
 
 All data stays on your infrastructure. Drift has no telemetry, external API calls, or data collection.
+
+**Data deletion:** Running `drift db remove <name>` permanently deletes all collected data for that database, including query stats, query text, and snapshot state.
 
 **Note:** Query text may reveal schema information and access patterns. This is standard for database monitoring tools and is generally safe for internal infrastructure use.
 
@@ -317,7 +409,3 @@ Environment variables use the prefix `DRIFT_` with double underscores for nestin
 export DRIFT_STORAGE__DSN="postgresql://drift:drift@localhost:5433/drift"
 export DRIFT_COLLECTOR__INTERVAL_SECONDS=60
 ```
-
-## Project Structure
-
-See `CLAUDE.md` for detailed project structure and implementation phases.

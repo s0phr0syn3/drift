@@ -392,6 +392,142 @@ def save_snapshot_state(
         session.add(state)
 
 
+def get_new_queries(
+    session: Session,
+    database_id: int | None = None,
+    since_hours: int = 24,
+    limit: int = 50,
+) -> list[dict]:
+    """Get queries that first appeared within the given time window.
+
+    Args:
+        session: Database session
+        database_id: Optional filter for specific database
+        since_hours: Look for queries first seen in last N hours
+        limit: Maximum number of results
+
+    Returns:
+        List of dicts with query info, ordered by first_seen desc (newest first)
+    """
+    since = datetime.now(timezone.utc) - timedelta(hours=since_hours)
+
+    stmt = (
+        select(QueryText)
+        .where(QueryText.first_seen >= since)
+        .order_by(QueryText.first_seen.desc())
+        .limit(limit)
+    )
+
+    if database_id is not None:
+        stmt = stmt.where(QueryText.database_id == database_id)
+
+    results = []
+    for qt in session.scalars(stmt):
+        results.append({
+            "queryid": qt.queryid,
+            "database_id": qt.database_id,
+            "query": qt.query,
+            "query_type": qt.query_type,
+            "tables": qt.tables,
+            "first_seen": qt.first_seen,
+        })
+
+    return results
+
+
+def rollup_hourly(session: Session, hours_back: int = 24) -> dict[str, int]:
+    """Aggregate raw stats into hourly buckets.
+
+    Processes raw data from the last N hours and inserts/updates hourly rollups.
+    Safe to run multiple times - uses upsert semantics.
+
+    Args:
+        session: Database session
+        hours_back: How many hours back to process (default 24)
+
+    Returns:
+        Dict with count of hours processed and rows upserted
+    """
+    from sqlalchemy import func
+    from sqlalchemy.dialects.postgresql import insert
+
+    from drift.storage.models import QueryStatsHourly
+
+    since = datetime.now(timezone.utc) - timedelta(hours=hours_back)
+
+    # Aggregate raw data by hour
+    time_bucket = func.date_trunc("hour", QueryStatsRaw.snapshot_time)
+
+    stmt = (
+        select(
+            time_bucket.label("hour"),
+            QueryStatsRaw.database_id,
+            QueryStatsRaw.queryid,
+            func.sum(QueryStatsRaw.calls_delta).label("calls"),
+            func.sum(QueryStatsRaw.total_exec_time_delta).label("total_time"),
+            func.sum(QueryStatsRaw.rows_delta).label("rows"),
+            func.sum(QueryStatsRaw.shared_blks_hit_delta).label("blks_hit"),
+            func.sum(QueryStatsRaw.shared_blks_read_delta).label("blks_read"),
+            func.sum(QueryStatsRaw.temp_blks_read_delta).label("temp_read"),
+            func.sum(QueryStatsRaw.temp_blks_written_delta).label("temp_written"),
+        )
+        .where(QueryStatsRaw.snapshot_time >= since)
+        .group_by(time_bucket, QueryStatsRaw.database_id, QueryStatsRaw.queryid)
+    )
+
+    rows_upserted = 0
+    hours_seen = set()
+
+    for row in session.execute(stmt):
+        hours_seen.add(row.hour)
+
+        calls = int(row.calls) if row.calls else 0
+        total_time = float(row.total_time) if row.total_time else 0.0
+        blks_hit = int(row.blks_hit) if row.blks_hit else 0
+        blks_read = int(row.blks_read) if row.blks_read else 0
+        total_blks = blks_hit + blks_read
+        temp_total = (int(row.temp_read) if row.temp_read else 0) + \
+                     (int(row.temp_written) if row.temp_written else 0)
+
+        # Calculate derived metrics
+        mean_time = total_time / calls if calls > 0 else None
+        cache_hit_ratio = (blks_hit / total_blks * 100) if total_blks > 0 else None
+
+        # Upsert into hourly table
+        insert_stmt = insert(QueryStatsHourly).values(
+            hour=row.hour,
+            database_id=row.database_id,
+            queryid=row.queryid,
+            calls=calls,
+            total_time_ms=total_time,
+            mean_time_ms=mean_time,
+            rows=int(row.rows) if row.rows else 0,
+            cache_hit_ratio=cache_hit_ratio,
+            temp_blks_total=temp_total,
+        )
+
+        # On conflict, update with new values
+        upsert_stmt = insert_stmt.on_conflict_do_update(
+            index_elements=["hour", "database_id", "queryid"],
+            set_={
+                "calls": insert_stmt.excluded.calls,
+                "total_time_ms": insert_stmt.excluded.total_time_ms,
+                "mean_time_ms": insert_stmt.excluded.mean_time_ms,
+                "rows": insert_stmt.excluded.rows,
+                "cache_hit_ratio": insert_stmt.excluded.cache_hit_ratio,
+                "temp_blks_total": insert_stmt.excluded.temp_blks_total,
+            },
+        )
+
+        session.execute(upsert_stmt)
+        rows_upserted += 1
+
+    return {
+        "hours_processed": len(hours_seen),
+        "rows_upserted": rows_upserted,
+    }
+
+
 def prune_old_data(
     session: Session,
     raw_days: int = 7,

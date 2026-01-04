@@ -13,7 +13,7 @@ from sqlalchemy import (
     Text,
     create_engine,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -151,6 +151,51 @@ class SnapshotState(Base):
     temp_blks_written: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
     snapshot_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AlertRule(Base):
+    """Alert rule configuration.
+
+    Defines conditions that trigger alerts, such as latency increases,
+    cache hit ratio drops, or temp disk usage spikes.
+    """
+
+    __tablename__ = "alert_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    rule_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Rule types: latency_increase, cache_drop, temp_disk, new_query
+    threshold: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    # e.g., {"percent_increase": 50} or {"min_ratio": 90}
+    notification: Mapped[dict | None] = mapped_column(JSONB)
+    # e.g., {"webhook_url": "https://..."}
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+    # Relationships
+    events: Mapped[list["AlertEvent"]] = relationship(back_populates="rule")
+
+
+class AlertEvent(Base):
+    """Triggered alert event.
+
+    Records when an alert rule was triggered, with details about what caused it.
+    """
+
+    __tablename__ = "alert_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int | None] = mapped_column(ForeignKey("alert_rules.id"))
+    database_id: Mapped[int | None] = mapped_column(ForeignKey("monitored_databases.id"))
+    queryid: Mapped[int | None] = mapped_column(BigInteger)
+    triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+    details: Mapped[dict | None] = mapped_column(JSONB)
+    # e.g., {"current_value": 150, "baseline_value": 100, "percent_change": 50}
+    acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # Relationships
+    rule: Mapped["AlertRule"] = relationship(back_populates="events")
 
 
 def get_engine(dsn: str):

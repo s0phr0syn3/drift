@@ -26,6 +26,8 @@ from drift.storage.queries import (
     get_snapshot_state,
     save_snapshot_state,
     prune_old_data,
+    rollup_hourly,
+    get_new_queries,
 )
 from drift.collector.snapshot import take_snapshot, extract_query_type, extract_tables
 from drift.collector.delta import calculate_deltas_from_state
@@ -415,6 +417,68 @@ def prune(ctx: click.Context, raw_days: int | None, hourly_days: int | None, yes
         click.echo(f"Deleted {result['query_stats_hourly']} hourly stat rows")
 
 
+@cli.command("rollup")
+@click.option("--hours", "-h", default=24, help="Process data from last N hours (default: 24)")
+@click.pass_context
+def rollup(ctx: click.Context, hours: int) -> None:
+    """Aggregate raw stats into hourly buckets.
+
+    Processes raw query stats and creates/updates hourly rollups for efficient
+    long-term storage and analysis. Safe to run multiple times.
+    """
+    config = ctx.obj["config"]
+
+    click.echo(f"Rolling up data from last {hours} hours...")
+
+    with get_session(config.storage.dsn) as session:
+        result = rollup_hourly(session, hours)
+
+        click.echo(f"Processed {result['hours_processed']} hours")
+        click.echo(f"Upserted {result['rows_upserted']} hourly stat rows")
+
+
+@cli.command("new-queries")
+@click.option("--database", "-d", help="Filter by database name")
+@click.option("--since", "-s", default="24h", help="Time window (e.g., 24h, 7d)")
+@click.option("--limit", "-n", default=50, help="Maximum number of results")
+@click.pass_context
+def new_queries(ctx: click.Context, database: str | None, since: str, limit: int) -> None:
+    """Show queries that first appeared recently.
+
+    Useful for detecting new query patterns, potential issues from deployments,
+    or unexpected queries hitting the database.
+    """
+    config = ctx.obj["config"]
+    since_hours = _parse_period(since)
+
+    with get_session(config.storage.dsn) as session:
+        database_id = None
+        if database:
+            db = get_monitored_database_by_name(session, database)
+            if not db:
+                click.echo(f"Error: Database '{database}' not found.", err=True)
+                sys.exit(1)
+            database_id = db.id
+
+        queries = get_new_queries(session, database_id, since_hours, limit)
+
+        if not queries:
+            click.echo(f"No new queries found in the last {since}.")
+            return
+
+        click.echo(f"New queries (first seen in last {since}):\n")
+        click.echo(f"{'QUERYID':<20} {'TYPE':<10} {'FIRST SEEN':<20} {'QUERY'}")
+        click.echo("-" * 90)
+
+        for q in queries:
+            queryid = q["queryid"]
+            query_type = q["query_type"] or "?"
+            first_seen = q["first_seen"].strftime("%Y-%m-%d %H:%M:%S") if q["first_seen"] else "N/A"
+            query_preview = (q["query"] or "")[:35].replace("\n", " ")
+
+            click.echo(f"{queryid:<20} {query_type:<10} {first_seen:<20} {query_preview}...")
+
+
 def _parse_period(period: str) -> int:
     """Parse a period string like '24h' or '7d' into hours."""
     period = period.lower().strip()
@@ -599,6 +663,172 @@ def _draw_ascii_chart(times: list, values: list, label: str, width: int = 60, he
         end_label = sampled_times[-1].strftime("%m/%d %H:%M")
         padding = len(sampled_values) - len(start_label) - len(end_label)
         click.echo(f"          {start_label}{' ' * max(0, padding)}{end_label}")
+
+
+# Alert commands
+@cli.group()
+def alerts() -> None:
+    """Alert management commands."""
+    pass
+
+
+@alerts.command("rules")
+@click.pass_context
+def alerts_rules(ctx: click.Context) -> None:
+    """List all alert rules."""
+    from drift.analysis.alerts import get_alert_rules
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        rules = get_alert_rules(session, enabled_only=False)
+
+        if not rules:
+            click.echo("No alert rules configured. Use 'drift alerts add' to create one.")
+            return
+
+        click.echo(f"{'ID':<5} {'NAME':<25} {'TYPE':<18} {'ENABLED':<8} {'THRESHOLD'}")
+        click.echo("-" * 80)
+
+        for rule in rules:
+            enabled = "yes" if rule.enabled else "no"
+            threshold_str = str(rule.threshold)[:20] + "..." if len(str(rule.threshold)) > 20 else str(rule.threshold)
+            click.echo(f"{rule.id:<5} {rule.name:<25} {rule.rule_type:<18} {enabled:<8} {threshold_str}")
+
+
+@alerts.command("add")
+@click.argument("name")
+@click.option("--type", "-t", "rule_type", required=True,
+              type=click.Choice(["latency_increase", "cache_drop", "temp_disk"]),
+              help="Type of anomaly to detect")
+@click.option("--threshold", "-T", default=50, help="Threshold value (percent for latency/temp, points for cache)")
+@click.option("--webhook", "-w", help="Webhook URL for notifications")
+@click.pass_context
+def alerts_add(ctx: click.Context, name: str, rule_type: str, threshold: int, webhook: str | None) -> None:
+    """Add a new alert rule."""
+    from drift.analysis.alerts import create_alert_rule
+
+    config = ctx.obj["config"]
+
+    # Build threshold config based on rule type
+    if rule_type == "latency_increase":
+        threshold_config = {"percent_increase": threshold}
+    elif rule_type == "cache_drop":
+        threshold_config = {"min_drop_points": threshold}
+    elif rule_type == "temp_disk":
+        threshold_config = {"percent_increase": threshold}
+    else:
+        threshold_config = {"value": threshold}
+
+    notification = {"webhook_url": webhook} if webhook else None
+
+    with get_session(config.storage.dsn) as session:
+        rule = create_alert_rule(session, name, rule_type, threshold_config, notification)
+        click.echo(f"Created alert rule '{name}' (ID: {rule.id})")
+
+
+@alerts.command("remove")
+@click.argument("rule_id", type=int)
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation")
+@click.pass_context
+def alerts_remove(ctx: click.Context, rule_id: int, yes: bool) -> None:
+    """Remove an alert rule."""
+    from drift.storage.models import AlertRule
+
+    config = ctx.obj["config"]
+
+    if not yes:
+        click.confirm(f"Remove alert rule {rule_id}?", abort=True)
+
+    with get_session(config.storage.dsn) as session:
+        rule = session.get(AlertRule, rule_id)
+        if rule:
+            session.delete(rule)
+            click.echo(f"Removed alert rule '{rule.name}'")
+        else:
+            click.echo(f"Error: Alert rule {rule_id} not found.", err=True)
+            sys.exit(1)
+
+
+@alerts.command("events")
+@click.option("--unack", is_flag=True, help="Show only unacknowledged alerts")
+@click.option("--limit", "-n", default=20, help="Number of events to show")
+@click.pass_context
+def alerts_events(ctx: click.Context, unack: bool, limit: int) -> None:
+    """List recent alert events."""
+    from drift.analysis.alerts import get_alert_events
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        acknowledged = False if unack else None
+        events = get_alert_events(session, acknowledged=acknowledged, limit=limit)
+
+        if not events:
+            msg = "No unacknowledged alerts." if unack else "No alert events."
+            click.echo(msg)
+            return
+
+        click.echo(f"{'ID':<6} {'TIME':<20} {'TYPE':<18} {'QUERYID':<20} {'ACK'}")
+        click.echo("-" * 80)
+
+        for event in events:
+            time_str = event.triggered_at.strftime("%Y-%m-%d %H:%M:%S") if event.triggered_at else "N/A"
+            anomaly_type = event.details.get("anomaly_type", "?") if event.details else "?"
+            ack = "yes" if event.acknowledged else "no"
+            click.echo(f"{event.id:<6} {time_str:<20} {anomaly_type:<18} {event.queryid or 'N/A':<20} {ack}")
+
+
+@alerts.command("ack")
+@click.argument("event_id", type=int)
+@click.pass_context
+def alerts_ack(ctx: click.Context, event_id: int) -> None:
+    """Acknowledge an alert event."""
+    from drift.analysis.alerts import acknowledge_alert
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        if acknowledge_alert(session, event_id):
+            click.echo(f"Acknowledged alert event {event_id}")
+        else:
+            click.echo(f"Error: Alert event {event_id} not found.", err=True)
+            sys.exit(1)
+
+
+@alerts.command("check")
+@click.option("--database", "-d", help="Check specific database only")
+@click.option("--no-notify", is_flag=True, help="Skip webhook notifications")
+@click.pass_context
+def alerts_check(ctx: click.Context, database: str | None, no_notify: bool) -> None:
+    """Run anomaly detection and generate alerts.
+
+    Checks all queries for performance anomalies based on configured rules.
+    Creates alert events and sends notifications for any triggered rules.
+    """
+    from drift.analysis.alerts import run_anomaly_check
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        database_id = None
+        if database:
+            db = get_monitored_database_by_name(session, database)
+            if not db:
+                click.echo(f"Error: Database '{database}' not found.", err=True)
+                sys.exit(1)
+            database_id = db.id
+
+        click.echo("Running anomaly detection...")
+        events = run_anomaly_check(session, database_id, notify=not no_notify)
+
+        if events:
+            click.echo(f"Created {len(events)} alert events:")
+            for event in events:
+                anomaly_type = event.details.get("anomaly_type", "?") if event.details else "?"
+                click.echo(f"  - {anomaly_type} for query {event.queryid}")
+        else:
+            click.echo("No anomalies detected.")
 
 
 if __name__ == "__main__":
