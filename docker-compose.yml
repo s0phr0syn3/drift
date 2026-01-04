@@ -1,0 +1,40 @@
+services:
+  drift-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: drift
+      POSTGRES_PASSWORD: drift
+      POSTGRES_DB: drift
+    ports:
+      - "5433:5432"
+    volumes:
+      - drift-db-data:/var/lib/postgresql/data
+      - ./docker/postgres-drift/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U drift -d drift"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  target-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    ports:
+      - "5434:5432"
+    volumes:
+      - target-db-data:/var/lib/postgresql/data
+      - ./docker/postgres-target/pg_stat_statements.conf:/etc/postgresql/conf.d/pg_stat_statements.conf:ro
+      - ./docker/postgres-target/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    command: postgres -c shared_preload_libraries=pg_stat_statements -c config_file=/etc/postgresql/conf.d/pg_stat_statements.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  drift-db-data:
+  target-db-data:
