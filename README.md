@@ -4,6 +4,94 @@ PostgreSQL query performance analyzer with dbt integration.
 
 Drift collects query performance metrics from `pg_stat_statements` and correlates them with dbt model definitions to provide unified performance observability.
 
+## Why Drift?
+
+If you're running dbt on PostgreSQL, you're likely missing critical performance insights. Here's what Drift gives you:
+
+| Without Drift | With Drift |
+|--------------|------------|
+| dbt reports "model took 45s" | See actual Postgres execution time (42s query + 3s dbt overhead) |
+| No visibility into cache efficiency | See 73% cache hit ratio → get index recommendations |
+| Can't track model performance over time | Historical trends with before/after comparisons |
+| "Which model is hurting the database?" | Models ranked by actual DB impact, not just dbt time |
+| No connection between dbt and pg_stat_statements | Unified view: model → query → performance metrics |
+| Guessing if your optimization worked | Annotations with automatic before/after comparison |
+
+### Example Insight
+
+After correlating your dbt models with database queries, Drift might show:
+
+```
+Model: fct_orders
+Materialized: incremental
+Correlated Query: 8847291034
+Confidence: 100% (fingerprint match)
+
+Insights:
+⚠️  Low cache hit ratio (67%)
+    → Consider adding index on orders(customer_id, created_at)
+
+⚠️  Spilling to disk (128MB temp)
+    → Increase work_mem or add index for ORDER BY clause
+
+ℹ️  Mean execution 2,847ms
+    → Run EXPLAIN ANALYZE to identify bottlenecks
+```
+
+This connects your dbt model directly to what's happening in Postgres—something neither dbt nor your orchestrator can tell you.
+
+## dbt Integration
+
+Drift works with **both dbt Core and dbt Cloud**. It doesn't run dbt—it analyzes the artifacts dbt produces after runs.
+
+### dbt Core
+
+```bash
+# After dbt run completes
+drift dbt ingest ./target/ --project my_project
+```
+
+### dbt Cloud
+
+Fetch artifacts via the dbt Cloud API, then send to Drift:
+
+```python
+import httpx
+
+# Fetch from dbt Cloud
+manifest = httpx.get(
+    f"https://cloud.getdbt.com/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/manifest.json",
+    headers={"Authorization": f"Token {token}"}
+).json()
+
+run_results = httpx.get(
+    f"https://cloud.getdbt.com/api/v2/accounts/{account_id}/runs/{run_id}/artifacts/run_results.json",
+    headers={"Authorization": f"Token {token}"}
+).json()
+
+# Send to Drift
+httpx.post("http://localhost:8000/api/v1/dbt/ingest", json={
+    "project_name": "analytics",
+    "manifest": manifest,
+    "run_results": run_results
+})
+```
+
+### Orchestrator Integration (Dagster, Airflow, etc.)
+
+Add a post-dbt step to ingest artifacts. Example with Dagster:
+
+```python
+from dagster import asset
+from dagster_dbt import dbt_assets
+
+@asset(deps=[my_dbt_assets])
+def ingest_dbt_to_drift():
+    """Capture dbt artifacts after each run."""
+    import subprocess
+    subprocess.run(["drift", "dbt", "ingest", "target/", "--project", "analytics"])
+```
+
 ## Requirements
 
 - Python 3.11+

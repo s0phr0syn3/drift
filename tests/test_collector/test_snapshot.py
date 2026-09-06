@@ -25,9 +25,20 @@ class TestExtractQueryType:
     def test_delete(self):
         assert extract_query_type("DELETE FROM users WHERE id = 1") == "DELETE"
 
-    def test_other(self):
-        assert extract_query_type("CREATE TABLE foo (id int)") == "OTHER"
-        assert extract_query_type("DROP TABLE foo") == "OTHER"
+    def test_ddl(self):
+        assert extract_query_type("CREATE TABLE foo (id int)") == "DDL"
+        assert extract_query_type("DROP TABLE foo") == "DDL"
+        assert extract_query_type("ALTER TABLE foo ADD COLUMN bar int") == "DDL"
+        assert extract_query_type("TRUNCATE TABLE foo") == "DDL"
+
+    def test_transaction(self):
+        assert extract_query_type("BEGIN") == "TRANSACTION"
+        assert extract_query_type("COMMIT") == "TRANSACTION"
+        assert extract_query_type("ROLLBACK") == "TRANSACTION"
+
+    def test_utility(self):
+        assert extract_query_type("SET statement_timeout = '10s'") == "UTILITY"
+        assert extract_query_type("VACUUM users") == "UTILITY"
 
     def test_whitespace(self):
         assert extract_query_type("  SELECT * FROM users") == "SELECT"

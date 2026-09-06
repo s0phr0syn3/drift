@@ -276,6 +276,8 @@ def get_query_details(
         "total_time_ms": total_time,
         "mean_time_ms": total_time / total_calls if total_calls else None,
         "total_rows": int(stats_row.total_rows) if stats_row.total_rows else 0,
+        "shared_blks_hit": total_blks_hit,
+        "shared_blks_read": total_blks_read,
         "cache_hit_ratio": cache_hit_ratio,
         "temp_blks_read": int(stats_row.total_temp_read) if stats_row.total_temp_read else 0,
         "temp_blks_written": int(stats_row.total_temp_written) if stats_row.total_temp_written else 0,

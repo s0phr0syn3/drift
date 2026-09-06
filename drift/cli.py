@@ -831,5 +831,295 @@ def alerts_check(ctx: click.Context, database: str | None, no_notify: bool) -> N
             click.echo("No anomalies detected.")
 
 
+# dbt Integration Commands
+@cli.group("dbt")
+def dbt_group() -> None:
+    """dbt integration commands."""
+    pass
+
+
+@dbt_group.command("ingest")
+@click.argument("target_dir", type=click.Path(exists=True))
+@click.option("--project", "-p", default=None, help="Project name (default: from manifest)")
+@click.pass_context
+def dbt_ingest(ctx: click.Context, target_dir: str, project: str | None) -> None:
+    """Ingest dbt artifacts from target directory.
+
+    Parses manifest.json and run_results.json (if present) from a dbt target
+    directory. Stores model definitions and correlates them with pg_stat_statements
+    queries using SQL fingerprinting.
+
+    Example:
+        drift dbt ingest ./target/
+        drift dbt ingest ./target/ --project my_analytics
+    """
+    import json
+    from drift.dbt.parser import parse_dbt_target
+    from drift.dbt.fingerprint import fingerprint_sql
+    from drift.dbt.correlate import correlate_model_to_queries
+    from drift.storage.models import DbtProject, DbtModelRecord, DbtRun, DbtModelExecution, QueryText
+    from sqlalchemy import select
+
+    config = ctx.obj["config"]
+    target_path = Path(target_dir)
+
+    click.echo(f"Parsing dbt artifacts from {target_path}...")
+
+    try:
+        models, run_results = parse_dbt_target(target_path)
+    except FileNotFoundError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"  Found {len(models)} models")
+    if run_results:
+        click.echo(f"  Found run results with {len(run_results.executions)} model executions")
+
+    # Determine project name
+    if not project:
+        # Try to get from manifest
+        manifest_path = target_path / "manifest.json"
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        project = manifest.get("metadata", {}).get("project_name", "default")
+
+    click.echo(f"  Project: {project}")
+
+    with get_session(config.storage.dsn) as session:
+        # Get or create project
+        proj = session.scalar(select(DbtProject).where(DbtProject.name == project))
+        if not proj:
+            proj = DbtProject(name=project)
+            session.add(proj)
+            session.flush()
+            click.echo(f"  Created project '{project}'")
+
+        # Get existing queries for correlation
+        queries = []
+        for qt in session.scalars(select(QueryText)):
+            queries.append({
+                "queryid": qt.queryid,
+                "query": qt.query,
+                "fingerprint": qt.fingerprint,
+                "tables": qt.tables,
+            })
+        click.echo(f"  Loaded {len(queries)} queries for correlation")
+
+        # Process models
+        models_ingested = 0
+        models_correlated = 0
+
+        for unique_id, model in models.items():
+            # Calculate fingerprint
+            sql_fp = fingerprint_sql(model.compiled_sql) if model.compiled_sql else None
+
+            # Check if model exists
+            existing = session.scalar(
+                select(DbtModelRecord).where(
+                    DbtModelRecord.project_id == proj.id,
+                    DbtModelRecord.unique_id == unique_id,
+                )
+            )
+
+            if existing:
+                # Update
+                existing.name = model.name
+                existing.schema_name = model.schema_name
+                existing.database_name = model.database
+                existing.alias = model.alias
+                existing.relation_name = model.relation_name
+                existing.materialized = model.materialized
+                existing.description = model.description
+                existing.compiled_sql = model.compiled_sql
+                existing.sql_fingerprint = sql_fp
+                existing.depends_on = model.depends_on
+                existing.tags = model.tags
+                existing.updated_at = datetime.now()
+                model_record = existing
+            else:
+                # Create
+                model_record = DbtModelRecord(
+                    project_id=proj.id,
+                    unique_id=unique_id,
+                    name=model.name,
+                    schema_name=model.schema_name,
+                    database_name=model.database,
+                    alias=model.alias,
+                    relation_name=model.relation_name,
+                    materialized=model.materialized,
+                    description=model.description,
+                    compiled_sql=model.compiled_sql,
+                    sql_fingerprint=sql_fp,
+                    depends_on=model.depends_on,
+                    tags=model.tags,
+                )
+                session.add(model_record)
+                session.flush()
+
+            models_ingested += 1
+
+            # Correlate with pg_stat_statements
+            if model.compiled_sql and queries:
+                correlation = correlate_model_to_queries(model, queries)
+                if correlation:
+                    model_record.correlated_queryid = correlation.queryid
+                    model_record.correlation_type = correlation.match_type
+                    model_record.correlation_confidence = correlation.confidence
+                    models_correlated += 1
+
+        click.echo(f"  Ingested {models_ingested} models")
+        click.echo(f"  Correlated {models_correlated} models with queries")
+
+        # Process run results if present
+        if run_results:
+            # Count stats
+            success_count = sum(1 for e in run_results.executions if e.status == "success")
+            error_count = sum(1 for e in run_results.executions if e.status == "error")
+            total_time = sum(e.execution_time for e in run_results.executions)
+
+            run = DbtRun(
+                project_id=proj.id,
+                invocation_id=run_results.invocation_id,
+                started_at=run_results.started_at,
+                completed_at=run_results.completed_at,
+                status=run_results.status,
+                total_execution_time=total_time,
+                models_run=len(run_results.executions),
+                models_success=success_count,
+                models_error=error_count,
+            )
+            session.add(run)
+            session.flush()
+
+            # Create execution records
+            for exec_result in run_results.executions:
+                model_record = session.scalar(
+                    select(DbtModelRecord).where(
+                        DbtModelRecord.project_id == proj.id,
+                        DbtModelRecord.unique_id == exec_result.unique_id,
+                    )
+                )
+                if model_record:
+                    execution = DbtModelExecution(
+                        run_id=run.id,
+                        model_id=model_record.id,
+                        status=exec_result.status,
+                        execution_time=exec_result.execution_time,
+                        rows_affected=exec_result.rows_affected,
+                        db_queryid=model_record.correlated_queryid,
+                    )
+                    session.add(execution)
+
+            click.echo(f"  Created run record (ID: {run.id})")
+            click.echo(f"    Status: {run_results.status}")
+            click.echo(f"    Total time: {total_time:.1f}s")
+            click.echo(f"    Success: {success_count}, Errors: {error_count}")
+
+    click.echo("Done!")
+
+
+@dbt_group.command("models")
+@click.option("--project", "-p", help="Filter by project name")
+@click.option("--correlated", is_flag=True, help="Only show models with query correlation")
+@click.pass_context
+def dbt_models(ctx: click.Context, project: str | None, correlated: bool) -> None:
+    """List dbt models."""
+    from drift.storage.models import DbtProject, DbtModelRecord
+    from sqlalchemy import select
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        stmt = select(DbtModelRecord).order_by(DbtModelRecord.name)
+
+        if project:
+            proj = session.scalar(select(DbtProject).where(DbtProject.name == project))
+            if not proj:
+                click.echo(f"Error: Project '{project}' not found.", err=True)
+                sys.exit(1)
+            stmt = stmt.where(DbtModelRecord.project_id == proj.id)
+
+        if correlated:
+            stmt = stmt.where(DbtModelRecord.correlated_queryid.isnot(None))
+
+        models = list(session.scalars(stmt))
+
+        if not models:
+            click.echo("No dbt models found. Run 'drift dbt ingest' first.")
+            return
+
+        click.echo(f"{'NAME':<30} {'MATERIALIZED':<12} {'CORRELATED':<12} {'CONFIDENCE'}")
+        click.echo("-" * 75)
+
+        for m in models:
+            corr_status = "yes" if m.correlated_queryid else "no"
+            confidence = f"{m.correlation_confidence:.0%}" if m.correlation_confidence else "-"
+            click.echo(f"{m.name:<30} {m.materialized or 'view':<12} {corr_status:<12} {confidence}")
+
+
+@dbt_group.command("runs")
+@click.option("--project", "-p", help="Filter by project name")
+@click.option("--limit", "-n", default=10, help="Number of runs to show")
+@click.pass_context
+def dbt_runs(ctx: click.Context, project: str | None, limit: int) -> None:
+    """List recent dbt runs."""
+    from drift.storage.models import DbtProject, DbtRun
+    from sqlalchemy import select
+
+    config = ctx.obj["config"]
+
+    with get_session(config.storage.dsn) as session:
+        stmt = select(DbtRun).order_by(DbtRun.started_at.desc()).limit(limit)
+
+        if project:
+            proj = session.scalar(select(DbtProject).where(DbtProject.name == project))
+            if not proj:
+                click.echo(f"Error: Project '{project}' not found.", err=True)
+                sys.exit(1)
+            stmt = stmt.where(DbtRun.project_id == proj.id)
+
+        runs = list(session.scalars(stmt))
+
+        if not runs:
+            click.echo("No dbt runs found. Run 'drift dbt ingest' with run_results.json.")
+            return
+
+        click.echo(f"{'ID':<6} {'STARTED':<20} {'STATUS':<10} {'MODELS':<8} {'TIME'}")
+        click.echo("-" * 60)
+
+        for r in runs:
+            started = r.started_at.strftime("%Y-%m-%d %H:%M") if r.started_at else "N/A"
+            models_str = f"{r.models_success or 0}/{r.models_run or 0}"
+            time_str = f"{r.total_execution_time:.1f}s" if r.total_execution_time else "-"
+            click.echo(f"{r.id:<6} {started:<20} {r.status or 'unknown':<10} {models_str:<8} {time_str}")
+
+
+@cli.command("serve")
+@click.option("--host", "-h", default="127.0.0.1", help="Host to bind to")
+@click.option("--port", "-p", default=8000, help="Port to bind to")
+@click.option("--reload", is_flag=True, help="Enable auto-reload for development")
+@click.pass_context
+def serve(ctx: click.Context, host: str, port: int, reload: bool) -> None:
+    """Start the Drift API server.
+
+    Runs the FastAPI application with uvicorn. The API provides REST endpoints
+    for querying performance data and managing alerts.
+
+    API documentation is available at /docs (Swagger) or /redoc.
+    """
+    import uvicorn
+
+    click.echo(f"Starting Drift API server at http://{host}:{port}")
+    click.echo(f"API docs: http://{host}:{port}/docs")
+    click.echo("Press Ctrl+C to stop")
+
+    uvicorn.run(
+        "drift.api.app:app",
+        host=host,
+        port=port,
+        reload=reload,
+    )
+
+
 if __name__ == "__main__":
     cli()

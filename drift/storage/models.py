@@ -198,6 +198,148 @@ class AlertEvent(Base):
     rule: Mapped["AlertRule"] = relationship(back_populates="events")
 
 
+class Annotation(Base):
+    """Performance change annotation/marker.
+
+    Records when a performance-related change was made (index added, config changed,
+    query rewritten, etc.) so users can track before/after impact and prove ROI.
+    """
+
+    __tablename__ = "annotations"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str] = mapped_column(String(50), nullable=False)
+    # Categories: index, config, query_rewrite, deployment, vacuum, other
+
+    # When the change was applied (user-specified, may differ from created_at)
+    applied_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+    # Optional: link to specific database and/or query
+    database_id: Mapped[int | None] = mapped_column(ForeignKey("monitored_databases.id"))
+    queryid: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Metadata
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+    __table_args__ = (
+        Index("idx_annotations_applied_at", "applied_at"),
+        Index("idx_annotations_queryid", "queryid"),
+    )
+
+
+# ============================================================================
+# dbt Integration Models
+# ============================================================================
+
+
+class DbtProject(Base):
+    """A dbt project being tracked."""
+
+    __tablename__ = "dbt_projects"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+    # Relationships
+    models: Mapped[list["DbtModelRecord"]] = relationship(back_populates="project")
+    runs: Mapped[list["DbtRun"]] = relationship(back_populates="project")
+
+
+class DbtModelRecord(Base):
+    """A dbt model definition from manifest.json."""
+
+    __tablename__ = "dbt_models"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("dbt_projects.id"), nullable=False)
+    unique_id: Mapped[str] = mapped_column(String(500), nullable=False)  # model.project.name
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    schema_name: Mapped[str | None] = mapped_column(String(255))
+    database_name: Mapped[str | None] = mapped_column(String(255))
+    alias: Mapped[str | None] = mapped_column(String(255))
+    relation_name: Mapped[str | None] = mapped_column(String(500))  # schema.table
+    materialized: Mapped[str | None] = mapped_column(String(50))  # table, view, incremental
+    description: Mapped[str | None] = mapped_column(Text)
+    compiled_sql: Mapped[str | None] = mapped_column(Text)
+    sql_fingerprint: Mapped[str | None] = mapped_column(String(64))  # SHA256 of normalized SQL
+    depends_on: Mapped[list[str] | None] = mapped_column(ARRAY(Text))  # upstream model unique_ids
+    tags: Mapped[list[str] | None] = mapped_column(ARRAY(Text))
+
+    # Correlation with pg_stat_statements
+    correlated_queryid: Mapped[int | None] = mapped_column(BigInteger)
+    correlation_type: Mapped[str | None] = mapped_column(String(50))  # fingerprint, table_name, partial
+    correlation_confidence: Mapped[float | None] = mapped_column(Double)
+
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utc_now)
+
+    # Relationships
+    project: Mapped["DbtProject"] = relationship(back_populates="models")
+    executions: Mapped[list["DbtModelExecution"]] = relationship(back_populates="model")
+
+    __table_args__ = (
+        Index("idx_dbt_models_unique_id", "project_id", "unique_id", unique=True),
+        Index("idx_dbt_models_fingerprint", "sql_fingerprint"),
+        Index("idx_dbt_models_queryid", "correlated_queryid"),
+    )
+
+
+class DbtRun(Base):
+    """A dbt run execution."""
+
+    __tablename__ = "dbt_runs"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("dbt_projects.id"), nullable=False)
+    invocation_id: Mapped[str | None] = mapped_column(String(255))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str | None] = mapped_column(String(50))  # success, error, partial
+    total_execution_time: Mapped[float | None] = mapped_column(Double)  # seconds
+    models_run: Mapped[int | None] = mapped_column()
+    models_success: Mapped[int | None] = mapped_column()
+    models_error: Mapped[int | None] = mapped_column()
+
+    # Relationships
+    project: Mapped["DbtProject"] = relationship(back_populates="runs")
+    executions: Mapped[list["DbtModelExecution"]] = relationship(back_populates="run")
+
+    __table_args__ = (
+        Index("idx_dbt_runs_started_at", "started_at"),
+    )
+
+
+class DbtModelExecution(Base):
+    """Execution of a specific model in a dbt run."""
+
+    __tablename__ = "dbt_model_executions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("dbt_runs.id"), nullable=False)
+    model_id: Mapped[int] = mapped_column(ForeignKey("dbt_models.id"), nullable=False)
+
+    status: Mapped[str | None] = mapped_column(String(50))  # success, error, skipped
+    execution_time: Mapped[float | None] = mapped_column(Double)  # seconds
+    rows_affected: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Correlated pg_stat_statements metrics (captured at run time)
+    db_queryid: Mapped[int | None] = mapped_column(BigInteger)
+    db_total_time_ms: Mapped[float | None] = mapped_column(Double)
+    db_rows: Mapped[int | None] = mapped_column(BigInteger)
+    db_cache_hit_ratio: Mapped[float | None] = mapped_column(Double)
+    db_temp_blks: Mapped[int | None] = mapped_column(BigInteger)
+
+    # Relationships
+    run: Mapped["DbtRun"] = relationship(back_populates="executions")
+    model: Mapped["DbtModelRecord"] = relationship(back_populates="executions")
+
+    __table_args__ = (
+        Index("idx_dbt_executions_run_model", "run_id", "model_id"),
+    )
+
+
 def get_engine(dsn: str):
     """Create a SQLAlchemy engine for the given DSN."""
     return create_engine(dsn)

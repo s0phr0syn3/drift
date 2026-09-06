@@ -37,12 +37,44 @@ TABLE_PATTERN = re.compile(
 )
 
 
-def extract_query_type(query: str) -> str | None:
-    """Extract the query type (SELECT, INSERT, UPDATE, DELETE) from a query."""
+def extract_query_type(query: str) -> str:
+    """Extract the query type from a query.
+
+    Returns one of:
+    - DML: SELECT, INSERT, UPDATE, DELETE
+    - DDL: CREATE, ALTER, DROP, TRUNCATE
+    - TRANSACTION: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
+    - UTILITY: SET, SHOW, EXPLAIN, VACUUM, ANALYZE, REINDEX, CLUSTER
+    - DCL: GRANT, REVOKE
+    - OTHER: anything else
+    """
     query_stripped = query.strip().upper()
+
+    # DML
     for query_type in ("SELECT", "INSERT", "UPDATE", "DELETE"):
         if query_stripped.startswith(query_type):
             return query_type
+
+    # DDL
+    for keyword in ("CREATE", "ALTER", "DROP", "TRUNCATE"):
+        if query_stripped.startswith(keyword):
+            return "DDL"
+
+    # Transaction control
+    for keyword in ("BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "RELEASE", "START TRANSACTION"):
+        if query_stripped.startswith(keyword):
+            return "TRANSACTION"
+
+    # Utility commands
+    for keyword in ("SET", "SHOW", "EXPLAIN", "VACUUM", "ANALYZE", "REINDEX", "CLUSTER", "COPY"):
+        if query_stripped.startswith(keyword):
+            return "UTILITY"
+
+    # DCL (Data Control Language)
+    for keyword in ("GRANT", "REVOKE"):
+        if query_stripped.startswith(keyword):
+            return "DCL"
+
     return "OTHER"
 
 
